@@ -1061,3 +1061,53 @@ index f5456330b..3418ff475 100644
 -- 
 2.53.0
 
+From a1b2c3d4e5f60718293a4b5c6d7e8f9012345678 Mon Sep 17 00:00:00 2001
+From: luqqas96 <282232570+luqqas96@users.noreply.github.com>
+Date: Fri, 21 Aug 2026 16:36:55 +0000
+Subject: [PATCH] platform/x86: int3472: Map Surface Pro 7+ ov8865 DVDD supply pin
+
+On the Microsoft Surface Pro 7+, the INT3472:01 device declares the rear
+ov8865 sensor's DVDD rail as GPIO type 0x08 on pin 0xaf.
+
+Mainline discrete.c has no case for type 0x08, leaving the supply unregistered.
+In this tree, type 0x08 was tentatively mapped to "pwr1", which no sensor
+driver requests, leaving the regulator disabled (users=0) and causing the
+sensor to fail runtime resume and software reset with Error -121 (EREMOTEIO).
+
+Sweeping GPIO states during unbind/bind cycles and testing via DSDT override
+confirms that this pin is functionally the sensor's digital supply (DVDD).
+Mapping HID INT347A type 0x08 to INT3472_GPIO_TYPE_HANDSHAKE ("dvdd") in
+int3472_gpio_map[] allows the existing regulator registration path to provide
+the supply as "dvdd" without modifying the ov8865 driver or relying on
+out-of-tree supply names.
+
+Link: https://github.com/linux-surface/linux-surface/pull/2201
+Link: https://github.com/linux-surface/linux-surface/issues/1702
+Signed-off-by: luqqas96 <282232570+luqqas96@users.noreply.github.com>
+Patchset: cameras
+---
+ drivers/platform/x86/intel/int3472/discrete.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/drivers/platform/x86/intel/int3472/discrete.c b/drivers/platform/x86/intel/int3472/discrete.c
+index 20962e8ac..c2349887b 100644
+--- a/drivers/platform/x86/intel/int3472/discrete.c
++++ b/drivers/platform/x86/intel/int3472/discrete.c
+@@ -160,6 +160,13 @@ static const struct int3472_gpio_map int3472_gpio_map[] = {
+ 		.type_from = INT3472_GPIO_TYPE_HANDSHAKE,
+ 		.type_to = INT3472_GPIO_TYPE_HANDSHAKE,
+ 		.con_id = "dvdd",
+ 		.enable_time_us = 45 * USEC_PER_MSEC,
+ 	},
++	{	/* Surface Pro 7+ declares the ov8865 dvdd pin as type 0x08 */
++		.hid = "INT347A",
++		.type_from = 0x08,
++		.type_to = INT3472_GPIO_TYPE_HANDSHAKE,
++		.con_id = "dvdd",
++		.enable_time_us = GPIO_REGULATOR_ENABLE_TIME,
++	},
+ };
+-- 
+2.53.0
+
+
