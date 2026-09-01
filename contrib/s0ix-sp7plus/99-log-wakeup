@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Log what woke the machine up, and how much of the suspend was actually
+# spent in hardware sleep (S0ix).
+#
+# systemd runs sleep hooks as:  $1 = pre|post   $2 = suspend|hibernate|...
+# Install as /usr/lib/systemd/system-sleep/99-log-wakeup (chmod +x).
+#
+# Nothing here may fail hard: a sleep hook that exits non-zero can interfere
+# with the suspend cycle, so every read is guarded.
+
+LOG=/var/log/wake-diagnostics.log
+
+case "$1" in
+  pre)
+    echo "=== $(date '+%F %T') SUSPEND ($2) ===" >> "$LOG"
+    ;;
+  post)
+    {
+      echo "=== $(date '+%F %T') RESUME ($2) ==="
+
+      # Which IRQ woke us. This file holds a bare IRQ number.
+      irq=$(cat /sys/power/pm_wakeup_irq 2>/dev/null)
+      echo "  wake IRQ: ${irq:-(not available)}"
+      if [ -n "$irq" ]; then
+        grep -E "^\s*${irq}:" /proc/interrupts 2>/dev/null | sed 's/^/    /'
+      fi
+
+      # Wakeup sources that have registered wakeups (column 4 = wakeup_count).
+      # Note this counter is cumulative since boot, not per cycle -- compare
+      # across resumes to see which source is growing.
+      echo "  --- wakeup sources with wakeup_count > 0 ---"
+      awk 'NR==1 || ($4+0)>0 {print "    " $0}' \
+          /sys/kernel/debug/wakeup_sources 2>/dev/null | head -12
+
+      # Time the hardware really spent in S0ix during the last cycle.
+      # /sys/power/suspend_stats/last_hw_sleep exists since kernel 6.9 and is
+      # readable without debugfs.
+      hw=$(cat /sys/power/suspend_stats/last_hw_sleep 2>/dev/null)
+      if [ -n "$hw" ]; then
+        echo "  hardware sleep: ${hw} us ($((hw / 1000000)) s)"
+      else
+        echo "  hardware sleep: (not available)"
+      fi
+      echo
+    } >> "$LOG"
+    ;;
+esac
+
+exit 0
