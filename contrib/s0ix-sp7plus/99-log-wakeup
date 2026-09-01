@@ -1,45 +1,80 @@
 #!/usr/bin/env bash
-# Log what woke the machine up, and how much of the suspend was actually
-# spent in hardware sleep (S0ix).
+# Wake + S0ix residency diagnostics for Tiger Lake Surface devices.
+#   $1 = pre|post   $2 = suspend|hibernate|...
+# Install: /usr/lib/systemd/system-sleep/99-log-wakeup  (chmod +x)
 #
-# systemd runs sleep hooks as:  $1 = pre|post   $2 = suspend|hibernate|...
-# Install as /usr/lib/systemd/system-sleep/99-log-wakeup (chmod +x).
-#
-# Nothing here may fail hard: a sleep hook that exits non-zero can interfere
-# with the suspend cycle, so every read is guarded.
+# Nothing may fail hard: a sleep hook exiting non-zero can disturb suspend.
 
 LOG=/var/log/wake-diagnostics.log
+RUN=/run/s0ix-diag
+PMC=/sys/kernel/debug/pmc_core
+mkdir -p "$RUN" 2>/dev/null
 
 case "$1" in
   pre)
-    echo "=== $(date '+%F %T') SUSPEND ($2) ===" >> "$LOG"
+    date +%s > "$RUN/t.pre"
+    cat "$PMC/slp_s0_residency_usec" 2>/dev/null > "$RUN/slp.pre"
+    cat "$PMC/substate_residencies"  2>/dev/null > "$RUN/sub.pre"
+    {
+      echo "=== $(date '+%F %T') SUSPEND ($2) ==="
+      # LTR = latency tolerance each IP block advertises. A low value means
+      # "service me within N ns", which keeps the SoC out of deep S0ix
+      # substates. NOTE: read here the system is still awake, so these are
+      # awake-state values -- indicative, not proof of what blocks suspend.
+      echo "  --- LTR: IP blocks advertising a latency requirement ---"
+      awk '{ l=$0; name=""; ns=0; sn=0
+        if (match(l,/PMC[0-9]+:[A-Za-z0-9_]+/)) { name=substr(l,RSTART,RLENGTH); sub(/^PMC[0-9]+:/,"",name) }
+        if (match(l,/Non-Snoop\(ns\): *[0-9]+/)) { t=substr(l,RSTART,RLENGTH); sub(/[^0-9]*/,"",t); ns=t+0
+           l=substr(l,1,RSTART-1) substr(l,RSTART+RLENGTH) }
+        if (match(l,/Snoop\(ns\): *[0-9]+/))     { t=substr(l,RSTART,RLENGTH); sub(/[^0-9]*/,"",t); sn=t+0 }
+        if (name!="" && (ns>0 || sn>0)) printf "    %-18s non-snoop=%-9d snoop=%-9d (ns)\n", name, ns, sn
+      }' "$PMC/ltr_show" 2>/dev/null
+    } >> "$LOG"
     ;;
+
   post)
+    cat "$PMC/slp_s0_residency_usec" 2>/dev/null > "$RUN/slp.post"
+    cat "$PMC/substate_residencies"  2>/dev/null > "$RUN/sub.post"
     {
       echo "=== $(date '+%F %T') RESUME ($2) ==="
 
-      # Which IRQ woke us. This file holds a bare IRQ number.
       irq=$(cat /sys/power/pm_wakeup_irq 2>/dev/null)
       echo "  wake IRQ: ${irq:-(not available)}"
-      if [ -n "$irq" ]; then
-        grep -E "^\s*${irq}:" /proc/interrupts 2>/dev/null | sed 's/^/    /'
-      fi
+      [ -n "$irq" ] && grep -E "^\s*${irq}:" /proc/interrupts 2>/dev/null | sed 's/^/    /'
 
-      # Wakeup sources that have registered wakeups (column 4 = wakeup_count).
-      # Note this counter is cumulative since boot, not per cycle -- compare
-      # across resumes to see which source is growing.
+      # Column 4 is wakeup_count: times this source aborted suspend or woke
+      # the system. Cumulative since boot -- compare across resumes.
       echo "  --- wakeup sources with wakeup_count > 0 ---"
       awk 'NR==1 || ($4+0)>0 {print "    " $0}' \
           /sys/kernel/debug/wakeup_sources 2>/dev/null | head -12
 
-      # Time the hardware really spent in S0ix during the last cycle.
-      # /sys/power/suspend_stats/last_hw_sleep exists since kernel 6.9 and is
-      # readable without debugfs.
+      wall=0
+      [ -r "$RUN/t.pre" ] && wall=$(( $(date +%s) - $(cat "$RUN/t.pre") ))
       hw=$(cat /sys/power/suspend_stats/last_hw_sleep 2>/dev/null)
-      if [ -n "$hw" ]; then
-        echo "  hardware sleep: ${hw} us ($((hw / 1000000)) s)"
-      else
-        echo "  hardware sleep: (not available)"
+      hw_s=$(( ${hw:-0} / 1000000 ))
+      echo "  suspended for : ${wall} s"
+      echo "  hardware sleep: ${hw_s} s"
+      # hw_s > wall means the counter did not advance for this cycle, i.e. the
+      # machine never reached hardware sleep. Signal, not noise.
+      if [ "$wall" -gt 0 ] && [ "$hw_s" -gt "$wall" ]; then
+        echo "  S0ix residency: NONE (counter stale: never reached hw sleep)"
+      elif [ "$wall" -gt 0 ] && [ "$hw_s" -gt 0 ]; then
+        echo "  S0ix residency: $(( hw_s * 100 / wall ))%"
+      fi
+
+      # Independent corroboration from the PMC counter.
+      if [ -s "$RUN/slp.pre" ] && [ -s "$RUN/slp.post" ]; then
+        a=$(cat "$RUN/slp.pre"); b=$(cat "$RUN/slp.post")
+        echo "  slp_s0 delta  : $(( (b - a) / 1000000 )) s"
+      fi
+
+      # Which substate absorbed the time. S0i3.x is the deep one that matters.
+      if [ -s "$RUN/sub.pre" ] && [ -s "$RUN/sub.post" ]; then
+        echo "  --- substate residency delta ---"
+        awk 'NR==FNR { if ($2 ~ /^[0-9]+$/) a[$1]=$2; next }
+             ($2 ~ /^[0-9]+$/) && ($1 in a) {
+               d=($2-a[$1])/1000000; if (d>0) printf "    %-10s %d s\n", $1, d }' \
+            "$RUN/sub.pre" "$RUN/sub.post"
       fi
       echo
     } >> "$LOG"

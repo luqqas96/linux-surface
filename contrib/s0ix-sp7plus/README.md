@@ -78,23 +78,52 @@ Writing a name to `/proc/acpi/wakeup` toggles it rather than setting it, so
 the unit checks the current state first and is safe to run repeatedly. Drop
 the `TXHC` line if you do wake the machine from Thunderbolt devices.
 
-## 4. Diagnosing wakeups
+## 4. Diagnosing wakeups and S0ix residency
 
 `99-log-wakeup` is a `systemd-sleep` hook that appends one entry per
-suspend/resume cycle to `/var/log/wake-diagnostics.log`: the wake IRQ and its
-`/proc/interrupts` line, wakeup sources with a non-zero `wakeup_count`, and
-how long the hardware actually stayed in S0ix.
+suspend/resume cycle to `/var/log/wake-diagnostics.log`.
 
 ```bash
-sudo cp 99-log-wakeup /usr/lib/systemd/system-sleep/
-sudo chmod +x /usr/lib/systemd/system-sleep/99-log-wakeup
+sudo install -m 755 99-log-wakeup /usr/lib/systemd/system-sleep/
 ```
 
-The interesting number is `hardware sleep` versus the wall-clock time between
-the `SUSPEND` and `RESUME` lines. If the machine was suspended for eight hours
-but only slept for one, something is keeping the SoC out of S0ix -- that is a
-different problem from being woken up, and this log is how you tell them
-apart.
+A cycle looks like this:
+
+```
+=== 2026-09-01 22:20:05 SUSPEND (suspend) ===
+  --- LTR: IP blocks advertising a latency requirement ---
+    XHCI               non-snoop=0         snoop=499712    (ns)
+    AGGREGATED_SYSTEM  non-snoop=0         snoop=1047552   (ns)
+=== 2026-09-01 22:20:15 RESUME (suspend) ===
+  wake IRQ: 14
+      14:  10  ...  IR-IO-APIC  14-fasteoi  INT34C5:00
+  suspended for : 10 s
+  hardware sleep: 9 s
+  S0ix residency: 90%
+  slp_s0 delta  : 9 s
+  --- substate residency delta ---
+    S0i3.0     9 s
+```
+
+Two different failures show up here, and they are easy to confuse:
+
+**Something is waking you up.** The `wake IRQ` line and the wakeup-source
+table name the culprit. Note that `wakeup_count` is cumulative since boot, so
+compare it across resumes rather than reading it as a per-cycle value.
+
+**Something is stopping you from staying asleep.** Compare `S0ix residency`
+against the wall-clock time. A machine suspended for eight hours that only
+reached hardware sleep for one is not being woken up -- it is failing to stay
+in S0ix, and no amount of chasing wake sources will fix that. `slp_s0 delta`
+corroborates the number from an independent PMC counter, and the substate
+delta shows whether the time went to the deep state (`S0i3.x`) or a shallow
+one.
+
+The `LTR` block is the first place to look for the second failure. Each IP
+block advertises how long it tolerates being unattended; a block asking for
+tens of microseconds keeps the SoC out of substates whose exit latency is
+measured in milliseconds. These values are sampled while the system is still
+awake, so treat them as a lead rather than proof.
 
 The log is not rotated; add a `/etc/logrotate.d/` snippet if you intend to
 leave it installed long-term.
@@ -119,8 +148,13 @@ no measured "before" column to compare against.
 ### Known limitation
 
 Long suspends still show poor S0ix residency: on an overnight suspend the
-hardware reached S0ix for roughly one hour out of ten. The wake loop is fixed,
-but something on this platform still limits sustained hardware sleep, and the
-cause is not identified yet. If you are chasing battery drain during suspend,
-install the hook in section 4 first and check that number before assuming
-wakeups are to blame.
+hardware reached S0ix for roughly one hour out of ten. Short suspends are
+fine, and the substate delta shows the time does go to `S0i3.0`, so the SoC
+reaches the deep state and then keeps leaving it -- without generating a
+system wakeup, which is why the wake log looks clean while the battery drains.
+
+The wake loop is fixed; this is a separate, still unexplained problem. The
+`LTR` block logged at suspend time is the most promising lead, but I have not
+confirmed a culprit, so this README does not name one. If you are chasing
+battery drain during suspend, install the hook in section 4 first and check
+the residency number before assuming wakeups are to blame.
