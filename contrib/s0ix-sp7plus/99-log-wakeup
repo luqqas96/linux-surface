@@ -50,22 +50,31 @@ case "$1" in
 
       wall=0
       [ -r "$RUN/t.pre" ] && wall=$(( $(date +%s) - $(cat "$RUN/t.pre") ))
-      hw=$(cat /sys/power/suspend_stats/last_hw_sleep 2>/dev/null)
-      hw_s=$(( ${hw:-0} / 1000000 ))
       echo "  suspended for : ${wall} s"
-      echo "  hardware sleep: ${hw_s} s"
-      # hw_s > wall means the counter did not advance for this cycle, i.e. the
-      # machine never reached hardware sleep. Signal, not noise.
-      if [ "$wall" -gt 0 ] && [ "$hw_s" -gt "$wall" ]; then
-        echo "  S0ix residency: NONE (counter stale: never reached hw sleep)"
-      elif [ "$wall" -gt 0 ] && [ "$hw_s" -gt 0 ]; then
-        echo "  S0ix residency: $(( hw_s * 100 / wall ))%"
-      fi
 
-      # Independent corroboration from the PMC counter.
+      # Residency is computed from the PMC slp_s0 counter, which the driver
+      # accumulates in 64 bits and does not wrap.
       if [ -s "$RUN/slp.pre" ] && [ -s "$RUN/slp.post" ]; then
         a=$(cat "$RUN/slp.pre"); b=$(cat "$RUN/slp.post")
-        echo "  slp_s0 delta  : $(( (b - a) / 1000000 )) s"
+        slp=$(( (b - a) / 1000000 ))
+        echo "  in S0ix       : ${slp} s"
+        [ "$wall" -gt 0 ] && [ "$slp" -gt 0 ] && \
+          echo "  S0ix residency: $(( slp * 100 / wall ))%"
+      fi
+
+      # NOTE: /sys/power/suspend_stats/last_hw_sleep is derived from a 32-bit
+      # microsecond counter and wraps every 2^32 us (4295 s / 71.6 min). For
+      # any longer suspend it reports (actual mod 4295 s), which understates
+      # the truth badly -- a 10 h suspend at full residency reads as ~8%.
+      # Logged for reference only; never compute residency from it.
+      hw=$(cat /sys/power/suspend_stats/last_hw_sleep 2>/dev/null)
+      hw_s=$(( ${hw:-0} / 1000000 ))
+      if [ "$wall" -gt 4294 ]; then
+        echo "  last_hw_sleep : ${hw_s} s (wrapped, see note in script)"
+      elif [ "$hw_s" -gt "$wall" ]; then
+        echo "  last_hw_sleep : ${hw_s} s (stale: did not advance this cycle)"
+      else
+        echo "  last_hw_sleep : ${hw_s} s"
       fi
 
       # Which substate absorbed the time. S0i3.x is the deep one that matters.

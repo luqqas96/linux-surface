@@ -97,12 +97,12 @@ A cycle looks like this:
 === 2026-09-01 22:20:15 RESUME (suspend) ===
   wake IRQ: 14
       14:  10  ...  IR-IO-APIC  14-fasteoi  INT34C5:00
-  suspended for : 10 s
-  hardware sleep: 9 s
-  S0ix residency: 90%
-  slp_s0 delta  : 9 s
+  suspended for : 34315 s
+  in S0ix       : 34293 s
+  S0ix residency: 99%
+  last_hw_sleep : 4228 s (wrapped, see note in script)
   --- substate residency delta ---
-    S0i3.0     9 s
+    S0i3.0     34267 s
 ```
 
 Two different failures show up here, and they are easy to confuse:
@@ -113,11 +113,19 @@ compare it across resumes rather than reading it as a per-cycle value.
 
 **Something is stopping you from staying asleep.** Compare `S0ix residency`
 against the wall-clock time. A machine suspended for eight hours that only
-reached hardware sleep for one is not being woken up -- it is failing to stay
-in S0ix, and no amount of chasing wake sources will fix that. `slp_s0 delta`
-corroborates the number from an independent PMC counter, and the substate
-delta shows whether the time went to the deep state (`S0i3.x`) or a shallow
-one.
+spent one in S0ix is not being woken up -- it is failing to stay asleep, and
+no amount of chasing wake sources will fix that. The substate delta shows
+whether the time went to the deep state (`S0i3.x`) or a shallow one.
+
+Measure this with the PMC `slp_s0_residency_usec` counter, which is what the
+residency line above uses. **Do not use
+`/sys/power/suspend_stats/last_hw_sleep` for this.** It is derived from a
+32-bit microsecond counter that wraps every 2^32 us -- 4295 s, or 71.6
+minutes -- so for any longer suspend it reports `actual mod 71.6 min`. On this
+machine a 9.5 h suspend at 99.9% residency reads as 4228 s there, which looks
+like a catastrophic 12%. Two overnight cycles matched the wrap prediction to
+within 0.3 s. The hook logs the value for reference and flags it once the
+suspend exceeds the wrap period.
 
 The `LTR` block is the first place to look for the second failure. Each IP
 block advertises how long it tolerates being unattended; a block asking for
@@ -130,31 +138,34 @@ leave it installed long-term.
 
 ## Results
 
-Measured over 114 suspend/resume cycles across 15 days of daily use, with all
-of the above applied:
+Measured over 114 suspend/resume cycles across 15 days of daily use, plus two
+~10 h cycles instrumented with the PMC counter, all with the tweaks above
+applied:
 
 | | Result |
 |---|---|
-| Cycles where the machine suspended but failed to sleep | 2 of 114 |
-| Hardware sleep residency, short suspends (minutes) | 99-100% |
-| Hardware sleep residency, long suspends (> 2 h) | 10-48% |
-| Longest single hardware sleep observed | ~1.16 h |
+| S0ix residency, suspends of 2-70 min (38 cycles) | 100% median, 98% worst |
+| Cycles in that set that failed to reach S0ix | 0 |
+| S0ix residency, two consecutive ~10 h suspends | 99.94% |
+| Substate the time went to | `S0i3.0` (the deep one) |
 
 Before the ALS fix the device could not stay suspended for more than a few
-seconds at a time; that behaviour is gone. These numbers are from the fixed
-configuration only -- the original failure was not instrumented, so there is
-no measured "before" column to compare against.
+seconds at a time; that behaviour is gone. The original failure was not
+instrumented, so there is no measured "before" column to compare against.
 
-### Known limitation
+Note the first row stops at 70 minutes. Those cycles were logged with
+`last_hw_sleep`, which is only trustworthy below the 71.6 minute wrap
+described in section 4; 27 of the 114 cycles ran longer and are not
+interpretable from that counter. The two 10 h figures come from
+`slp_s0_residency_usec` instead, which does not wrap.
 
-Long suspends still show poor S0ix residency: on an overnight suspend the
-hardware reached S0ix for roughly one hour out of ten. Short suspends are
-fine, and the substate delta shows the time does go to `S0i3.0`, so the SoC
-reaches the deep state and then keeps leaving it -- without generating a
-system wakeup, which is why the wake log looks clean while the battery drains.
+### A note on measuring this
 
-The wake loop is fixed; this is a separate, still unexplained problem. The
-`LTR` block logged at suspend time is the most promising lead, but I have not
-confirmed a culprit, so this README does not name one. If you are chasing
-battery drain during suspend, install the hook in section 4 first and check
-the residency number before assuming wakeups are to blame.
+An earlier revision of this file reported poor S0ix residency on long
+suspends. That was wrong, and the cause is worth repeating: it was the
+`last_hw_sleep` wrap described in section 4, not a hardware problem. Measured
+against the PMC counter, two consecutive ~10 h suspends both reached 99.94%
+residency.
+
+If you are diagnosing suspend battery drain on one of these machines, check
+which counter your numbers come from before concluding anything.
